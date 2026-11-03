@@ -1,6 +1,7 @@
 import json
 import logging
 import signal
+import threading
 
 from confluent_kafka import Consumer, Producer
 
@@ -32,34 +33,30 @@ def route(raw_value: bytes) -> tuple[str, str | None, dict]:
     return DLQ_TOPIC, key, payload
 
 
-def run() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+def run(
+    bootstrap: str = BOOTSTRAP,
+    group_id: str = GROUP_ID,
+    stop_event: threading.Event | None = None,
+) -> None:
+    """Process messages until stop_event is set."""
+    stop_event = stop_event or threading.Event()
 
     consumer = Consumer({
-        "bootstrap.servers": BOOTSTRAP,
-        "group.id": GROUP_ID,
+        "bootstrap.servers": bootstrap,
+        "group.id": group_id,
         "auto.offset.reset": "earliest",
         "enable.auto.commit": False,      # we commit only after the output is written
     })
     producer = Producer({
-        "bootstrap.servers": BOOTSTRAP,
+        "bootstrap.servers": bootstrap,
         "enable.idempotence": True,       # no duplicates if a send is retried
     })
-
-    running = True
-
-    def stop(*_):
-        nonlocal running
-        running = False
-
-    signal.signal(signal.SIGINT, stop)
-    signal.signal(signal.SIGTERM, stop)
 
     consumer.subscribe([RAW_TOPIC])
     log.info("gate started: %s -> %s | %s", RAW_TOPIC, CLEAN_TOPIC, DLQ_TOPIC)
 
     try:
-        while running:
+        while not stop_event.is_set():
             msg = consumer.poll(1.0)
             if msg is None:
                 continue
@@ -78,5 +75,13 @@ def run() -> None:
         log.info("gate stopped")
 
 
+def main() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    stop = threading.Event()
+    signal.signal(signal.SIGINT, lambda *_: stop.set())
+    signal.signal(signal.SIGTERM, lambda *_: stop.set())
+    run(stop_event=stop)
+
+
 if __name__ == "__main__":
-    run()
+    main()

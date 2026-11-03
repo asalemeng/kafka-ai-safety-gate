@@ -6,3 +6,4 @@ requires-python = ">=3.11"
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
+markers = ["integration: starts a real Kafka in Docker (slow)"]
