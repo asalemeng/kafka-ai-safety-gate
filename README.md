@@ -1,8 +1,12 @@
 # kafka-ai-safety-gate
 
+![CI](https://github.com/asalemeng/kafka-ai-safety-gate/actions/workflows/ci.yml/badge.svg)
+
 A safety gate for AI pipelines, built on Apache Kafka: every request is validated **before** it reaches the model, every rejection is kept with its reasons, and the whole thing is covered by automated tests.
 
 > Built in public as a QA / SDET portfolio project. The interesting part is not the filter, it is how the filter is tested, including the places where it fails.
+
+![How the gate works](docs/ai-safety-gate.png)
 
 ## The problem
 
@@ -42,7 +46,11 @@ The validator collects *all* reasons instead of stopping at the first one, so th
 
 ```
 .
+├── .github/workflows/
+│   └── ci.yml                  # GitHub Actions: unit tests, then integration tests
 ├── docker-compose.yml          # single-node Kafka (KRaft) with a health check
+├── docs/
+│   └── ai-safety-gate.png      # the illustration above
 ├── scripts/
 │   └── create-topics.sh        # idempotent topic creation
 ├── src/safety_gate/
@@ -50,8 +58,10 @@ The validator collects *all* reasons instead of stopping at the first one, so th
 │   ├── gate.py                 # consumer -> validate() -> producer (clean or DLQ)
 │   └── validator.py            # pure validation logic, no Kafka dependency
 ├── tests/
-│   └── unit/
-│       └── test_validator.py   # fast unit tests (< 1 s)
+│   ├── unit/
+│   │   └── test_validator.py   # 19 fast unit tests (< 1 s), no Kafka needed
+│   └── integration/
+│       └── test_gate_e2e.py    # 4 end-to-end tests on a real Kafka via Testcontainers (~20 s)
 ├── pyproject.toml
 └── requirements-dev.txt
 ```
@@ -68,10 +78,12 @@ python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements-dev.txt   # pytest, confluent-kafka
 
 # 3. Tests
-pytest -v
+pytest -v                      # everything: 22 passed, 1 xfailed
+pytest -m "not integration"    # unit tests only, under a second
+pytest -m integration          # end-to-end tests, starts its own Kafka in Docker
 ```
 
-Expected result: `18 passed, 1 xfailed`. The `xfailed` test is intentional, see below.
+The `xfailed` test is intentional, see [Testing strategy](#testing-strategy). The integration tests do not use the Compose Kafka: Testcontainers starts a separate broker on a random port and removes it afterwards.
 
 ## Try it manually
 
@@ -121,7 +133,7 @@ Stop the gate with Ctrl+C; it commits nothing it has not written and logs `gate 
 
 ## Testing strategy
 
-The validation logic is a pure function with no Kafka dependency, so most of the behaviour is covered by **fast unit tests** at the bottom of the test pyramid. Kafka itself will be covered by a smaller number of **integration tests** using Testcontainers (see roadmap).
+The validation logic is a pure function with no Kafka dependency, so most of the behaviour is covered by **fast unit tests** at the bottom of the test pyramid. The wiring to Kafka is covered by a smaller number of **integration tests** using Testcontainers, described below.
 
 What the unit tests cover, and why:
 
@@ -134,18 +146,39 @@ What the unit tests cover, and why:
 | False-positive check | a harmless prompt containing "instructions above" and "@ 5pm" passes | a gate that blocks real users is also a bug |
 | **Documented known gap** (`xfail`, strict) | the same injection written in Egyptian Arabic is **not** detected | the English-only keyword filter is a known weakness; the test makes it visible in every run and fails loudly if the gap is ever fixed without updating the test |
 
+### Integration tests
+
+`pytest -m integration` starts a real Kafka broker with Testcontainers on a random port, runs the gate in a background thread, and asserts where each message lands:
+
+- a clean request is promoted to the trusted topic **unchanged**
+- an injection attempt goes to the DLQ **with its reason**, and a separate negative test proves it **never** appears on the trusted topic
+- malformed JSON goes to the DLQ **without crashing the gate**, and a clean request sent right after it is still processed
+
+Design choices worth noting:
+
+- One broker and one gate per test module (starting a container costs ~20 s); each test uses a unique `request_id`, so tests share topics without interfering.
+- Assertions **wait for a condition with a deadline** instead of sleeping for a fixed time. A fixed 3-second wait was the first bug found while building this: it expired before the consumer group was even assigned.
+- The gate's `run()` takes the broker address and a stop event as parameters so a test can start and stop it; the signal handling lives in `main()`. Refactoring for testability is part of the work.
+- The first run of these tests caught a real defect (a refactor that had not been saved), which the 19 unit tests could not see because none of them starts the gate. The negative test passed during that run for the wrong reason, which is why it only means something next to the positive tests.
+
+### Continuous integration
+
+Every push and pull request runs the workflow in `.github/workflows/ci.yml` on a clean Ubuntu runner: unit tests first (fast feedback), then the integration tests with Testcontainers. The badge at the top of this file shows the result of the latest run.
+
 ## Roadmap
 
 - [x] Local Kafka with health check and idempotent topic script
 - [x] Validator with schema, size, PII and prompt-injection checks
 - [x] Unit tests, including a documented bypass and a false-positive check
 - [x] Kafka consumer/producer that routes messages to `clean` or `dlq`
-- [ ] Integration tests with Testcontainers (real Kafka inside the test)
-- [ ] GitHub Actions running unit and integration tests on every push
+- [x] Integration tests with Testcontainers (real Kafka inside the test)
+- [x] GitHub Actions running unit and integration tests on every push
 - [ ] Deduplication by `request_id` / exactly-once processing
 - [ ] Multilingual injection detection (closing the known gap)
 - [ ] Tamper-evident audit log of model decisions (hash chain)
 - [ ] Kill-switch topic honoured by the model service
+- [ ] Per-company policies: configurable rules (patterns, keywords, limits, block or redact) loaded per tenant
+- [ ] Semantic layer: embedding similarity against confidential documents and known attack prompts, multilingual
 
 ## Why Kafka?
 
