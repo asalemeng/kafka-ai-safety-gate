@@ -2,8 +2,9 @@ import json
 import logging
 import signal
 import threading
+from typing import Callable
 
-from confluent_kafka import Consumer, Producer
+from confluent_kafka import Consumer, Message, Producer
 
 from safety_gate.config import BOOTSTRAP, CLEAN_TOPIC, DLQ_TOPIC, GROUP_ID, RAW_TOPIC
 from safety_gate.validator import validate
@@ -37,23 +38,31 @@ def run(
     bootstrap: str = BOOTSTRAP,
     group_id: str = GROUP_ID,
     stop_event: threading.Event | None = None,
+    before_commit: Callable[[Message], None] | None = None,
 ) -> None:
-    """Process messages until stop_event is set."""
+    """Process messages exactly once until stop_event is set.
+
+    Each input message is handled in one Kafka transaction: the output write and
+    the input offset commit succeed together or not at all. `before_commit` is a
+    test hook called between the write and the commit (used to simulate crashes).
+    """
     stop_event = stop_event or threading.Event()
 
     consumer = Consumer({
         "bootstrap.servers": bootstrap,
         "group.id": group_id,
         "auto.offset.reset": "earliest",
-        "enable.auto.commit": False,      # we commit only after the output is written
+        "enable.auto.commit": False,          # offsets are committed inside the transaction
     })
     producer = Producer({
         "bootstrap.servers": bootstrap,
-        "enable.idempotence": True,       # no duplicates if a send is retried
+        "transactional.id": f"gate-{group_id}",   # one id per gate instance
+        "enable.idempotence": True,
     })
+    producer.init_transactions(30)   # seconds; fail loudly instead of hanging
 
     consumer.subscribe([RAW_TOPIC])
-    log.info("gate started: %s -> %s | %s", RAW_TOPIC, CLEAN_TOPIC, DLQ_TOPIC)
+    log.info("gate started (exactly-once): %s -> %s | %s", RAW_TOPIC, CLEAN_TOPIC, DLQ_TOPIC)
 
     try:
         while not stop_event.is_set():
@@ -64,14 +73,25 @@ def run(
                 log.error("consumer error: %s", msg.error())
                 continue
 
-            topic, key, payload = route(msg.value())
-            producer.produce(topic, key=key, value=json.dumps(payload).encode("utf-8"))
-            producer.flush()                 # wait until Kafka confirms the write...
-            consumer.commit(message=msg)     # ...only then mark the input as done
+            producer.begin_transaction()
+            try:
+                topic, key, payload = route(msg.value())
+                producer.produce(topic, key=key, value=json.dumps(payload).encode("utf-8"))
+                if before_commit:
+                    before_commit(msg)
+                producer.send_offsets_to_transaction(
+                    consumer.position(consumer.assignment()),
+                    consumer.consumer_group_metadata(),
+                )
+                producer.commit_transaction()
+            except Exception:
+                log.exception("transaction failed, aborting")
+                producer.abort_transaction()
+                raise
+
             log.info("%s -> %s key=%s", RAW_TOPIC, topic, key)
     finally:
         consumer.close()
-        producer.flush()
         log.info("gate stopped")
 
 
