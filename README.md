@@ -59,9 +59,12 @@ The validator collects *all* reasons instead of stopping at the first one, so th
 │   └── validator.py            # pure validation logic, no Kafka dependency
 ├── tests/
 │   ├── unit/
-│   │   └── test_validator.py   # 19 fast unit tests (< 1 s), no Kafka needed
+│   │   └── test_validator.py     # 19 fast unit tests (< 1 s), no Kafka needed
 │   └── integration/
-│       └── test_gate_e2e.py    # 4 end-to-end tests on a real Kafka via Testcontainers (~20 s)
+│       ├── conftest.py           # one Testcontainers Kafka per module, configured for transactions
+│       ├── helpers.py            # send_raw, wait_for (deadline-based), count_visible, new_request
+│       ├── test_gate_e2e.py      # 4 end-to-end routing tests (~20 s)
+│       └── test_exactly_once.py  # crash between write and commit must not produce a duplicate
 ├── pyproject.toml
 └── requirements-dev.txt
 ```
@@ -78,7 +81,7 @@ python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements-dev.txt   # pytest, confluent-kafka
 
 # 3. Tests
-pytest -v                      # everything: 22 passed, 1 xfailed
+pytest -v                      # everything: 23 passed, 1 xfailed
 pytest -m "not integration"    # unit tests only, under a second
 pytest -m integration          # end-to-end tests, starts its own Kafka in Docker
 ```
@@ -126,8 +129,8 @@ Stop the gate with Ctrl+C; it commits nothing it has not written and logs `gate 
 
 ## How the gate stays safe
 
-- **Write first, commit second.** The gate writes the output message and waits for the broker to confirm it, and only then commits the input offset. If it crashes in between, Kafka re-delivers the input on restart. A duplicate is possible; a lost request is not.
-- **Idempotent producer.** `enable.idempotence=true` means a retried send never creates a duplicate on the output topic.
+- **Exactly-once, via Kafka transactions.** For each input message the gate opens a transaction, writes the output, adds the input offset to the same transaction (`send_offsets_to_transaction`) and commits. Both happen or neither. If the gate crashes between the write and the commit, the transaction is aborted, the aborted write is invisible to `read_committed` consumers, and the message is re-delivered to the next gate instance and processed once. The first version of the gate used write-then-commit without a transaction, which allowed a duplicate in that window; `tests/integration/test_exactly_once.py` reproduces the crash and proves the duplicate is gone.
+- **Fail loudly, never hang.** `init_transactions` has a 30-second timeout. A broker that cannot support transactions (for example a single node whose transaction log still wants three replicas) produces an error, not a silently frozen service.
 - **Malformed input does not crash the service.** Non-JSON payloads go to the DLQ with reason `malformed_json`.
 - **Per-key ordering.** Output is keyed by `request_id`, so all events for one request stay in order within a partition. Order across partitions is not guaranteed, which is why the tests assert on content, not sequence.
 
@@ -153,6 +156,7 @@ What the unit tests cover, and why:
 - a clean request is promoted to the trusted topic **unchanged**
 - an injection attempt goes to the DLQ **with its reason**, and a separate negative test proves it **never** appears on the trusted topic
 - malformed JSON goes to the DLQ **without crashing the gate**, and a clean request sent right after it is still processed
+- **chaos test** (`test_exactly_once.py`): a gate instance is made to crash after writing its output and before committing; the test proves the half-done write is invisible to normal consumers, that a restarted instance processes the message again, and that exactly one copy is visible in the end
 
 Design choices worth noting:
 
@@ -160,6 +164,8 @@ Design choices worth noting:
 - Assertions **wait for a condition with a deadline** instead of sleeping for a fixed time. A fixed 3-second wait was the first bug found while building this: it expired before the consumer group was even assigned.
 - The gate's `run()` takes the broker address and a stop event as parameters so a test can start and stop it; the signal handling lives in `main()`. Refactoring for testability is part of the work.
 - The first run of these tests caught a real defect (a refactor that had not been saved), which the 19 unit tests could not see because none of them starts the gate. The negative test passed during that run for the wrong reason, which is why it only means something next to the positive tests.
+- The gate exposes a `before_commit` hook used only by the chaos test to crash at the worst possible moment. A small, explicit test seam beats monkey-patching the Kafka client.
+- Switching to transactions surfaced a second environment bug: on a single-node test broker, `init_transactions` hung forever because the internal transaction topic defaults to three replicas. The fix was two broker settings in the fixture plus a timeout in the gate, so the next person gets an error message instead of a frozen test.
 
 ### Continuous integration
 
@@ -173,7 +179,8 @@ Every push and pull request runs the workflow in `.github/workflows/ci.yml` on a
 - [x] Kafka consumer/producer that routes messages to `clean` or `dlq`
 - [x] Integration tests with Testcontainers (real Kafka inside the test)
 - [x] GitHub Actions running unit and integration tests on every push
-- [ ] Deduplication by `request_id` / exactly-once processing
+- [x] Exactly-once processing with Kafka transactions, proven by a crash-recovery test
+- [ ] Deduplication of client re-sends by `request_id` (same request sent twice by the client)
 - [ ] Multilingual injection detection (closing the known gap)
 - [ ] Tamper-evident audit log of model decisions (hash chain)
 - [ ] Kill-switch topic honoured by the model service
