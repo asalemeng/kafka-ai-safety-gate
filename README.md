@@ -2,7 +2,7 @@
 
 ![CI](https://github.com/asalemeng/kafka-ai-safety-gate/actions/workflows/ci.yml/badge.svg)
 
-A safety gate for AI pipelines, built on Apache Kafka: every request is validated **before** it reaches the model, every rejection is kept with its reasons, and the whole thing is covered by automated tests.
+A safety gate for AI pipelines, built on Apache Kafka: every request is validated **before** it reaches the model, every rejection is kept with its reasons, every decision is recorded in a tamper-evident audit log, and the whole thing is covered by automated tests.
 
 > Built in public as a QA / SDET portfolio project. The interesting part is not the filter, it is how the filter is tested, including the places where it fails.
 
@@ -17,18 +17,24 @@ Most AI systems trust every request they receive. A single malformed payload, a 
 ```mermaid
 flowchart LR
     client([Client / API gateway]) -->|JSON request| raw[("raw.inference.requests.v1<br/><i>untrusted</i>")]
-    raw --> gate{{"Validator<br/>schema · size · PII · injection"}}
+    raw --> gate{{"Gate<br/>schema · size · PII · injection<br/><i>exactly-once</i>"}}
     gate -->|PASS| clean[("clean.inference.requests.v1<br/><i>trusted</i>")]
     gate -->|BLOCK + reasons| dlq[("dlq.inference.rejected.v1<br/><i>quarantine</i>")]
     clean --> model[Model service]
     dlq --> review[Security review]
+    clean -.-> sink{{"Audit sink<br/>SHA-256 hash chain"}}
+    dlq -.-> sink
+    sink --> audit[("audit.gate-log.v1<br/><i>tamper-evident</i>")]
+    audit --> verifier[Verifier CLI]
 
     classDef topic fill:#fff3cd,stroke:#d9a400,color:#000
     classDef trusted fill:#dbe9ff,stroke:#2f6fed,color:#000
+    classDef auditc fill:#ffe1d6,stroke:#d9480f,color:#000
     classDef svc fill:#f6f6f6,stroke:#888,color:#000
     class raw,dlq topic
     class clean trusted
-    class client,gate,model,review svc
+    class audit auditc
+    class client,gate,model,review,sink,verifier svc
 ```
 
 1. Clients write raw JSON to an **untrusted** topic. Nothing downstream reads it directly.
@@ -40,6 +46,8 @@ flowchart LR
 3. Requests that pass are promoted to the **trusted** topic the model consumes.
 4. Requests that fail go to a **dead-letter topic** together with every reason that applied, so security can review them.
 
+5. An **audit sink** records every decision (allowed or blocked) as an entry in a hash chain, so the history cannot be altered without detection.
+
 The validator collects *all* reasons instead of stopping at the first one, so the DLQ shows the full picture of a bad request.
 
 ## Project structure
@@ -50,21 +58,27 @@ The validator collects *all* reasons instead of stopping at the first one, so th
 │   └── ci.yml                  # GitHub Actions: unit tests, then integration tests
 ├── docker-compose.yml          # single-node Kafka (KRaft) with a health check
 ├── docs/
-│   └── ai-safety-gate.png      # the illustration above
+│   ├── ai-safety-gate.png      # how the gate works
+│   └── audit-hash-chain.png    # how the audit chain detects tampering
 ├── scripts/
 │   └── create-topics.sh        # idempotent topic creation
 ├── src/safety_gate/
 │   ├── config.py               # broker and topic names from environment variables
-│   ├── gate.py                 # consumer -> validate() -> producer (clean or DLQ)
-│   └── validator.py            # pure validation logic, no Kafka dependency
+│   ├── validator.py            # pure validation logic, no Kafka dependency
+│   ├── gate.py                 # consumer -> validate() -> producer (clean or DLQ), transactional
+│   ├── audit.py                # pure hash-chain logic: append, verify
+│   ├── audit_sink.py           # chains every gate decision into the audit topic
+│   └── verify.py               # CLI: re-reads the audit topic and checks the chain
 ├── tests/
 │   ├── unit/
-│   │   └── test_validator.py     # 19 fast unit tests (< 1 s), no Kafka needed
+│   │   ├── test_validator.py     # 19 unit tests for the validation rules
+│   │   └── test_audit.py         # 15 unit tests for the hash chain (edit, delete, swap, forge)
 │   └── integration/
 │       ├── conftest.py           # one Testcontainers Kafka per module, configured for transactions
 │       ├── helpers.py            # send_raw, wait_for (deadline-based), count_visible, new_request
 │       ├── test_gate_e2e.py      # 4 end-to-end routing tests (~20 s)
-│       └── test_exactly_once.py  # crash between write and commit must not produce a duplicate
+│       ├── test_exactly_once.py  # crash between write and commit must not produce a duplicate
+│       └── test_audit_chain.py   # decisions are chained, no prompt is stored, forged history is detected
 ├── pyproject.toml
 └── requirements-dev.txt
 ```
@@ -81,7 +95,7 @@ python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements-dev.txt   # pytest, confluent-kafka
 
 # 3. Tests
-pytest -v                      # everything: 23 passed, 1 xfailed
+pytest -v                      # everything: 40 passed, 1 xfailed (~1 min)
 pytest -m "not integration"    # unit tests only, under a second
 pytest -m integration          # end-to-end tests, starts its own Kafka in Docker
 ```
@@ -127,6 +141,46 @@ docker exec kafka /opt/kafka/bin/kafka-console-consumer.sh \
 
 Stop the gate with Ctrl+C; it commits nothing it has not written and logs `gate stopped`.
 
+## Audit trail
+
+The gate makes the system safe; the audit trail makes it accountable.
+
+![How the audit chain detects tampering](docs/audit-hash-chain.png)
+
+The audit sink reads every gate output and appends one entry to `audit.gate-log.v1`:
+
+```json
+{
+  "seq": 1,
+  "prev_hash": "a3f1...9c",
+  "hash": "7c2e...41",
+  "event": {
+    "source_topic": "dlq.inference.rejected.v1",
+    "source_partition": 0,
+    "source_offset": 12,
+    "request_id": "r-2",
+    "verdict": "BLOCK",
+    "reasons": ["prompt_injection"],
+    "payload_sha256": "5e88...d8"
+  }
+}
+```
+
+- Each entry's hash covers the previous hash, its sequence number and its event, so editing, deleting, reordering or replacing any entry breaks the chain from that point on.
+- **No prompt text is stored**, only a SHA-256 of the message. An audit log should not become a second copy of the personal data the gate just blocked.
+- The topic has a single partition, because a chain needs one strict order. The sink writes transactionally and resumes the chain from the last entry after a restart.
+
+Verify the chain at any time:
+
+```bash
+PYTHONPATH=src python -m safety_gate.audit_sink    # terminal 2, next to the gate
+PYTHONPATH=src python -m safety_gate.verify        # prints "audit chain intact: N entries", exit code 0
+```
+
+If the history was altered, the verifier prints `AUDIT CHAIN BROKEN: first break at seq N` and exits with code 1, so it can run in CI or on a schedule.
+
+**Known limit, stated plainly:** a hash chain proves the log was not changed after the fact. It does not prove *who* wrote an entry: anyone with write access to the topic can append a valid next entry. Closing that gap needs ACLs on the audit topic and signed entries, both on the roadmap.
+
 ## How the gate stays safe
 
 - **Exactly-once, via Kafka transactions.** For each input message the gate opens a transaction, writes the output, adds the input offset to the same transaction (`send_offsets_to_transaction`) and commits. Both happen or neither. If the gate crashes between the write and the commit, the transaction is aborted, the aborted write is invisible to `read_committed` consumers, and the message is re-delivered to the next gate instance and processed once. The first version of the gate used write-then-commit without a transaction, which allowed a duplicate in that window; `tests/integration/test_exactly_once.py` reproduces the crash and proves the duplicate is gone.
@@ -156,6 +210,7 @@ What the unit tests cover, and why:
 - a clean request is promoted to the trusted topic **unchanged**
 - an injection attempt goes to the DLQ **with its reason**, and a separate negative test proves it **never** appears on the trusted topic
 - malformed JSON goes to the DLQ **without crashing the gate**, and a clean request sent right after it is still processed
+- **audit tests** (`test_audit_chain.py`): gate decisions appear in the audit topic as an intact chain with the right verdicts and reasons; the stored entries contain no prompt text; a forged entry that tries to replace history is reported by the verifier at its sequence number
 - **chaos test** (`test_exactly_once.py`): a gate instance is made to crash after writing its output and before committing; the test proves the half-done write is invisible to normal consumers, that a restarted instance processes the message again, and that exactly one copy is visible in the end
 
 Design choices worth noting:
@@ -182,7 +237,8 @@ Every push and pull request runs the workflow in `.github/workflows/ci.yml` on a
 - [x] Exactly-once processing with Kafka transactions, proven by a crash-recovery test
 - [ ] Deduplication of client re-sends by `request_id` (same request sent twice by the client)
 - [ ] Multilingual injection detection (closing the known gap)
-- [ ] Tamper-evident audit log of model decisions (hash chain)
+- [x] Tamper-evident audit log of gate decisions (SHA-256 hash chain, verifier CLI)
+- [ ] Signed audit entries and ACLs on the audit topic (who wrote it, not only whether it changed)
 - [ ] Kill-switch topic honoured by the model service
 - [ ] Per-company policies: configurable rules (patterns, keywords, limits, block or redact) loaded per tenant
 - [ ] Semantic layer: embedding similarity against confidential documents and known attack prompts, multilingual
