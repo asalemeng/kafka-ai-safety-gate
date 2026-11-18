@@ -2,7 +2,7 @@ import pytest
 from confluent_kafka.admin import AdminClient, NewTopic
 from testcontainers.community.kafka import KafkaContainer
 
-from safety_gate.config import CLEAN_TOPIC, DLQ_TOPIC, RAW_TOPIC
+from safety_gate.config import AUDIT_TOPIC, CLEAN_TOPIC, CONTROL_TOPIC, DLQ_TOPIC, RAW_TOPIC
 
 
 @pytest.fixture(scope="module")
@@ -19,6 +19,9 @@ def bootstrap():
         admin = AdminClient({"bootstrap.servers": servers})
         topics = [NewTopic(t, num_partitions=3, replication_factor=1)
                   for t in (RAW_TOPIC, CLEAN_TOPIC, DLQ_TOPIC)]
+        topics.append(NewTopic(AUDIT_TOPIC, num_partitions=1, replication_factor=1))  # one ordered chain
+        topics.append(NewTopic(CONTROL_TOPIC, num_partitions=1, replication_factor=1,
+                               config={"cleanup.policy": "compact"}))                 # keeps the latest command
         for future in admin.create_topics(topics).values():
             future.result()
         yield servers

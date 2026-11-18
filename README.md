@@ -2,7 +2,7 @@
 
 ![CI](https://github.com/asalemeng/kafka-ai-safety-gate/actions/workflows/ci.yml/badge.svg)
 
-A safety gate for AI pipelines, built on Apache Kafka: every request is validated **before** it reaches the model, every rejection is kept with its reasons, every decision is recorded in a tamper-evident audit log, and the whole thing is covered by automated tests.
+A safety gate for AI pipelines, built on Apache Kafka: every request is validated **before** it reaches the model, every rejection is kept with its reasons, every decision is recorded in a tamper-evident audit log, an operator can stop all traffic with a kill switch, and the whole thing is covered by automated tests.
 
 > Built in public as a QA / SDET portfolio project. The interesting part is not the filter, it is how the filter is tested, including the places where it fails.
 
@@ -26,6 +26,8 @@ flowchart LR
     dlq -.-> sink
     sink --> audit[("audit.gate-log.v1<br/><i>tamper-evident</i>")]
     audit --> verifier[Verifier CLI]
+    operator([Operator]) -->|disable / enable| control[("control.killswitch.v1<br/><i>compacted</i>")]
+    control -.->|read before every request| gate
 
     classDef topic fill:#fff3cd,stroke:#d9a400,color:#000
     classDef trusted fill:#dbe9ff,stroke:#2f6fed,color:#000
@@ -33,8 +35,8 @@ flowchart LR
     classDef svc fill:#f6f6f6,stroke:#888,color:#000
     class raw,dlq topic
     class clean trusted
-    class audit auditc
-    class client,gate,model,review,sink,verifier svc
+    class audit,control auditc
+    class client,gate,model,review,sink,verifier,operator svc
 ```
 
 1. Clients write raw JSON to an **untrusted** topic. Nothing downstream reads it directly.
@@ -47,6 +49,7 @@ flowchart LR
 4. Requests that fail go to a **dead-letter topic** together with every reason that applied, so security can review them.
 
 5. An **audit sink** records every decision (allowed or blocked) as an entry in a hash chain, so the history cannot be altered without detection.
+6. A **kill switch** lets an operator reject all traffic with one command, for example during an attack or when the validator itself is no longer trusted.
 
 The validator collects *all* reasons instead of stopping at the first one, so the DLQ shows the full picture of a bad request.
 
@@ -66,18 +69,22 @@ The validator collects *all* reasons instead of stopping at the first one, so th
 │   ├── config.py               # broker and topic names from environment variables
 │   ├── validator.py            # pure validation logic, no Kafka dependency
 │   ├── gate.py                 # consumer -> validate() -> producer (clean or DLQ), transactional
+│   ├── killswitch.py           # pure kill-switch logic: parse commands, hold the state
+│   ├── switchctl.py            # operator CLI: disable / enable the gate
 │   ├── audit.py                # pure hash-chain logic: append, verify
 │   ├── audit_sink.py           # chains every gate decision into the audit topic
 │   └── verify.py               # CLI: re-reads the audit topic and checks the chain
 ├── tests/
 │   ├── unit/
 │   │   ├── test_validator.py     # 19 unit tests for the validation rules
-│   │   └── test_audit.py         # 15 unit tests for the hash chain (edit, delete, swap, forge)
+│   │   ├── test_audit.py         # 15 unit tests for the hash chain (edit, delete, swap, forge)
+│   │   └── test_killswitch.py    # 18 unit tests for the switch (garbage never flips it)
 │   └── integration/
 │       ├── conftest.py           # one Testcontainers Kafka per module, configured for transactions
 │       ├── helpers.py            # send_raw, wait_for (deadline-based), count_visible, new_request
 │       ├── test_gate_e2e.py      # 4 end-to-end routing tests (~20 s)
 │       ├── test_exactly_once.py  # crash between write and commit must not produce a duplicate
+│       ├── test_kill_switch.py   # switch blocks harmless traffic; a restarted gate stays disabled
 │       └── test_audit_chain.py   # decisions are chained, no prompt is stored, forged history is detected
 ├── pyproject.toml
 └── requirements-dev.txt
@@ -95,7 +102,7 @@ python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements-dev.txt   # pytest, confluent-kafka
 
 # 3. Tests
-pytest -v                      # everything: 40 passed, 1 xfailed (~1 min)
+pytest -v                      # everything: 60 passed, 1 xfailed (~2 min)
 pytest -m "not integration"    # unit tests only, under a second
 pytest -m integration          # end-to-end tests, starts its own Kafka in Docker
 ```
@@ -181,6 +188,25 @@ If the history was altered, the verifier prints `AUDIT CHAIN BROKEN: first break
 
 **Known limit, stated plainly:** a hash chain proves the log was not changed after the fact. It does not prove *who* wrote an entry: anyone with write access to the topic can append a valid next entry. Closing that gap needs ACLs on the audit topic and signed entries, both on the roadmap.
 
+## Kill switch
+
+The emergency stop. One command, and the gate rejects every request until an operator switches it back on:
+
+```bash
+PYTHONPATH=src python -m safety_gate.switchctl disable --reason "injection wave" --by oncall
+PYTHONPATH=src python -m safety_gate.switchctl enable  --reason "all clear"      --by oncall
+```
+
+While the switch is on, each request goes to the DLQ with reason `kill_switch` and the operator's reason attached. The validator is not run at all, because one reason to pull the switch is that the validator can no longer be trusted. Nothing is dropped, and the audit chain records every rejected request like any other decision.
+
+Three properties, each covered by a test:
+
+- **A restart does not forget.** Commands live on a compacted topic, `control.killswitch.v1`, and the gate rebuilds the switch from that topic every time it starts. A gate started after the switch was pulled comes up disabled.
+- **Strict, at a stated price.** Before every request the gate asks the broker where the control topic ends and reads up to that point. A command confirmed before a request is processed is therefore always honoured. The cost is one extra broker round trip per request. A cheaper design would poll in the background and react within about a second; for an emergency stop, strict was chosen.
+- **Fails closed.** If the gate cannot confirm the state of the switch, it stops instead of guessing. Malformed commands are ignored in both directions: they can neither re-enable a disabled gate nor disable a working one.
+
+**Known limit:** anyone who can write to the control topic can flip the switch. In production the topic needs ACLs so that only operators can write to it.
+
 ## How the gate stays safe
 
 - **Exactly-once, via Kafka transactions.** For each input message the gate opens a transaction, writes the output, adds the input offset to the same transaction (`send_offsets_to_transaction`) and commits. Both happen or neither. If the gate crashes between the write and the commit, the transaction is aborted, the aborted write is invisible to `read_committed` consumers, and the message is re-delivered to the next gate instance and processed once. The first version of the gate used write-then-commit without a transaction, which allowed a duplicate in that window; `tests/integration/test_exactly_once.py` reproduces the crash and proves the duplicate is gone.
@@ -211,6 +237,7 @@ What the unit tests cover, and why:
 - an injection attempt goes to the DLQ **with its reason**, and a separate negative test proves it **never** appears on the trusted topic
 - malformed JSON goes to the DLQ **without crashing the gate**, and a clean request sent right after it is still processed
 - **audit tests** (`test_audit_chain.py`): gate decisions appear in the audit topic as an intact chain with the right verdicts and reasons; the stored entries contain no prompt text; a forged entry that tries to replace history is reported by the verifier at its sequence number
+- **kill switch tests** (`test_kill_switch.py`): a harmless request passes, the switch is pulled and the very next harmless request is rejected with the operator's reason and never reaches the trusted topic, the switch is released and traffic flows again; a second test pulls the switch while no gate is running and proves a gate started afterwards comes up disabled
 - **chaos test** (`test_exactly_once.py`): a gate instance is made to crash after writing its output and before committing; the test proves the half-done write is invisible to normal consumers, that a restarted instance processes the message again, and that exactly one copy is visible in the end
 
 Design choices worth noting:
@@ -220,6 +247,7 @@ Design choices worth noting:
 - The gate's `run()` takes the broker address and a stop event as parameters so a test can start and stop it; the signal handling lives in `main()`. Refactoring for testability is part of the work.
 - The first run of these tests caught a real defect (a refactor that had not been saved), which the 19 unit tests could not see because none of them starts the gate. The negative test passed during that run for the wrong reason, which is why it only means something next to the positive tests.
 - The gate exposes a `before_commit` hook used only by the chaos test to crash at the worst possible moment. A small, explicit test seam beats monkey-patching the Kafka client.
+- A gate started with a new consumer group reads the request topic from the beginning. The restart test shows it: the new gate re-processes earlier requests, this time rejecting them. In Kafka the group id is the service's identity, so the tests give every gate instance its own.
 - Switching to transactions surfaced a second environment bug: on a single-node test broker, `init_transactions` hung forever because the internal transaction topic defaults to three replicas. The fix was two broker settings in the fixture plus a timeout in the gate, so the next person gets an error message instead of a frozen test.
 
 ### Continuous integration
@@ -239,7 +267,8 @@ Every push and pull request runs the workflow in `.github/workflows/ci.yml` on a
 - [ ] Multilingual injection detection (closing the known gap)
 - [x] Tamper-evident audit log of gate decisions (SHA-256 hash chain, verifier CLI)
 - [ ] Signed audit entries and ACLs on the audit topic (who wrote it, not only whether it changed)
-- [ ] Kill-switch topic honoured by the model service
+- [x] Kill switch: compacted control topic, strict per-request check, operator CLI
+- [ ] ACLs on the control topic, and the kill switch honoured by the model service too
 - [ ] Per-company policies: configurable rules (patterns, keywords, limits, block or redact) loaded per tenant
 - [ ] Semantic layer: embedding similarity against confidential documents and known attack prompts, multilingual
 
