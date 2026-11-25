@@ -9,7 +9,9 @@ Two measurements per batch size:
   throughput  the gate starts with a backlog of N requests; requests per second
               until every decision is committed and visible
   latency     requests arrive at a steady rate; time from "client sent it" to
-              "a consumer can read the committed decision" (p50 / p95 / p99)
+              "a consumer can read the committed decision" (p50 / p95 / p99).
+              The rate is lowered to half the measured throughput if needed,
+              so the gate is never overloaded during this run.
 """
 from __future__ import annotations
 
@@ -51,9 +53,13 @@ def _output_id(msg) -> str | None:
     return payload.get("request_id")
 
 
-def _collect(settings: Settings, expected: int, sent_at: dict[str, float],
-             timeout: float) -> tuple[float, float, list[float]]:
-    """Read decisions until `expected` have arrived. Returns (time of first, time of last, latencies)."""
+def _collect(settings: Settings, expected: int, sent_at: dict[str, float], timeout: float,
+             caught_up: threading.Event | None = None, caught_up_after: int = 0) -> tuple[float, float, list[float]]:
+    """Read decisions until `expected` have arrived. Returns (time of first, time of last, latencies).
+
+    `caught_up` is set once `caught_up_after` decisions were read, i.e. when
+    this reader is connected and has nothing old left to read.
+    """
     consumer = Consumer(consumer_config(
         settings, f"bench-{uuid.uuid4()}", **{"isolation.level": "read_committed"}))
     consumer.subscribe([settings.topics.clean, settings.topics.dlq])
@@ -66,15 +72,19 @@ def _collect(settings: Settings, expected: int, sent_at: dict[str, float],
         while seen < expected:
             if time.monotonic() > deadline:
                 raise TimeoutError(f"only {seen} of {expected} decisions arrived within {timeout:.0f}s")
-            for msg in consumer.consume(500, timeout=0.5):
-                if msg.error():
-                    continue
-                seen += 1
-                last = time.monotonic()
-                first = first if first is not None else last
-                started = sent_at.get(_output_id(msg) or "")
-                if started is not None:
-                    latencies.append(last - started)
+            # One message at a time: waiting for a full batch here would add the
+            # waiting time to every latency that is measured.
+            msg = consumer.poll(0.05)
+            if msg is None or msg.error():
+                continue
+            seen += 1
+            if caught_up is not None and seen >= caught_up_after:
+                caught_up.set()
+            last = time.monotonic()
+            first = first if first is not None else last
+            started = sent_at.get(_output_id(msg) or "")
+            if started is not None:
+                latencies.append(last - started)
         return (first if first is not None else last), last, latencies
     finally:
         consumer.close()
@@ -112,14 +122,23 @@ def run_once(base: Settings, batch_size: int, messages: int, rate: int, seconds:
         throughput = (messages - 1) / max(last - first, 1e-6)
 
         # --- latency: steady arrival rate ---
+        # Latency only means something while the gate keeps up. If the asked
+        # rate is more than half of what the gate can do, use half instead;
+        # otherwise the number would measure the queue, not the gate.
+        rate = max(1, min(rate, int(throughput / 2)))
         sent_at: dict[str, float] = {}
         total = rate * seconds
         collector_result: dict = {}
+        caught_up = threading.Event()
         collector = threading.Thread(
             target=lambda: collector_result.update(
-                latencies=_collect(settings, messages + total, sent_at, timeout=seconds + 120)[2]),
+                latencies=_collect(settings, messages + total, sent_at, seconds + 240, caught_up, messages)[2]),
             daemon=True)
         collector.start()
+        # Start sending only when the reader is connected and has read the old
+        # decisions; otherwise its start-up time would be counted as latency.
+        if not caught_up.wait(timeout=120):
+            raise TimeoutError("the benchmark reader did not catch up with the backlog")
         begin = time.monotonic()
         for i in range(total):
             key, value = _request(messages + i)
@@ -130,7 +149,7 @@ def run_once(base: Settings, batch_size: int, messages: int, rate: int, seconds:
             if pause > 0:
                 time.sleep(pause)
         producer.flush()
-        collector.join(timeout=seconds + 130)
+        collector.join(timeout=seconds + 250)
         latencies = collector_result.get("latencies") or []
     finally:
         stop.set()
@@ -163,10 +182,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.json:
         print(json.dumps(results, indent=2))
         return 0
-    print(f"{'batch size':>10} | {'requests/s':>10} | {'p50 ms':>8} | {'p95 ms':>8} | {'p99 ms':>8}")
-    print("-" * 56)
+    print(f"{'batch size':>10} | {'requests/s':>10} | {'latency at':>10} | {'p50 ms':>8} | {'p95 ms':>8} | {'p99 ms':>8}")
+    print("-" * 71)
     for r in results:
-        print(f"{r['batch_size']:>10} | {r['throughput_per_s']:>10} | {r.get('p50_ms', '-'):>8} | "
+        at = f"{r['latency_rate_per_s']}/s" if "latency_rate_per_s" in r else "-"
+        print(f"{r['batch_size']:>10} | {r['throughput_per_s']:>10} | {at:>10} | {r.get('p50_ms', '-'):>8} | "
               f"{r.get('p95_ms', '-'):>8} | {r.get('p99_ms', '-'):>8}")
     return 0
 
