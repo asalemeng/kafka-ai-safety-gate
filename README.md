@@ -296,7 +296,20 @@ It measures two things per batch size, against a real Kafka (`KAFKA_BOOTSTRAP`),
 - **throughput**: the gate starts with a backlog; requests per second from the first committed decision to the last
 - **latency**: requests arrive at a steady rate; time from "client sent it" to "a consumer can read the committed decision" (p50 / p95 / p99)
 
-**No numbers are published here yet.** They have to come from a named machine with a real broker, and this has not been done. A small smoke run of the benchmark is part of the integration tests and prints its result in the CI log; a shared CI runner is not a fair machine for a headline number.
+Measured on 25 November 2026 on a Dell Precision 5680 laptop: single-node Kafka 3.8.0 in Docker on the same machine, Python 3.14, default settings, 20,000 requests (80 % harmless, 10 % personal data, 10 % injection), one gate instance.
+
+| Batch size | Throughput | Latency measured at | p50 | p95 | p99 |
+| --- | --- | --- | --- | --- | --- |
+| 1 (one transaction per request) | 44 requests/s | 22 requests/s | 111 ms | 295 ms | 313 ms |
+| 100 (default) | 2,327 requests/s | 200 requests/s | 152 ms | 349 ms | 393 ms |
+
+How to read this:
+
+- **Batching is worth about 50 times the throughput.** A Kafka transaction costs several round trips to the broker; sharing one transaction between up to 100 requests spreads that cost.
+- **Latency is 110 to 150 ms at the median even when the gate is far from busy.** That is more than the gate's own work explains (a transaction takes about 23 ms here), so most of it is waiting somewhere between the clients and the broker. Where exactly has not been investigated yet; nothing was tuned for this run.
+- **One laptop, one broker, one run.** Broker and gate share the machine, there is no replication and no network in between. Use the numbers to compare the two rows, not as a promise for production.
+
+The first version of this benchmark reported latencies that were wrong in three ways (it overloaded the slow configuration, its reader waited for full batches, and it counted its own start-up time). Those errors were found by looking at numbers that made no sense, and fixed before anything was published. A small smoke run of the benchmark is part of the integration tests.
 
 ## Security: TLS, login and access rules
 
@@ -464,7 +477,8 @@ Every push and pull request runs `.github/workflows/ci.yml`: lint (ruff), type c
 - [x] Similarity check against confidential documents and known attacks (simplified, limits measured)
 - [x] Linting, type checks, pinned dependencies, container image, one-command stack
 - [ ] Secure stack (TLS, logins, ACLs) verified end to end and added to CI
-- [ ] Benchmark numbers from a named reference machine
+- [x] Benchmark: throughput and latency measured, batch size 1 against 100
+- [ ] Find where the 110 to 150 ms of idle latency go, and tune
 - [ ] Multilingual embedding model behind the similarity check, measured on independent data
 - [ ] More kinds of personal data (names, phone numbers, addresses)
 - [ ] Output filtering (the model's answer on the way back)
