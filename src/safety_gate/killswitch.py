@@ -51,7 +51,7 @@ class KillSwitch:
 
     @property
     def reason(self) -> str:
-        return self._last.reason if self.disabled else ""
+        return self._last.reason if self._last is not None and self.disabled else ""
 
     @property
     def last_reason(self) -> str:

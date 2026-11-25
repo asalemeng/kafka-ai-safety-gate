@@ -1,0 +1,7 @@
+# Runtime dependencies, pinned. Loose ranges live in pyproject.toml.
+cffi==2.1.1
+confluent-kafka==2.16.1
+cryptography==50.0.2
+prometheus_client==0.26.0
+pycparser==3.12
+PyYAML==6.0.4

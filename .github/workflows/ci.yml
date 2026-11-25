@@ -4,11 +4,52 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 jobs:
-  tests:
+  checks:
+    name: Lint, types, unit tests (Python ${{ matrix.python }})
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12", "3.13", "3.14"]
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements-dev.txt
+          pip install -e . --no-deps
+
+      - name: Lint (ruff)
+        run: ruff check src tests
+
+      - name: Type check (mypy)
+        run: mypy
+
+      - name: Unit tests
+        run: pytest -v -m "not integration"
+
+      - name: Similarity check, measured on the labelled examples
+        run: >
+          python -m safety_gate.semantic_eval --policy examples/policy.yaml
+          --examples tests/data/semantic_eval.jsonl --tenant t-bank
+
+  integration:
+    name: Integration tests (real Kafka in Docker)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
 
     steps:
       - name: Check out code
@@ -19,12 +60,27 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
+          cache-dependency-path: requirements-dev.txt
 
       - name: Install dependencies
-        run: pip install -r requirements-dev.txt
-
-      - name: Unit tests
-        run: pytest -v -m "not integration"
+        run: |
+          pip install -r requirements-dev.txt
+          pip install -e . --no-deps
 
       - name: Integration tests (Testcontainers)
         run: pytest -v -m integration
+
+  image:
+    name: Container image builds
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Build the image
+        run: docker build -t safety-gate:ci .
+
+      - name: The image starts and finds its code
+        run: docker run --rm safety-gate:ci safety_gate.switchctl --help

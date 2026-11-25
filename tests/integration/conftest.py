@@ -1,13 +1,26 @@
+import os
+import uuid
+
 import pytest
-from confluent_kafka.admin import AdminClient, NewTopic
-from testcontainers.community.kafka import KafkaContainer
 
-from safety_gate.config import AUDIT_TOPIC, CLEAN_TOPIC, CONTROL_TOPIC, DLQ_TOPIC, RAW_TOPIC
+from safety_gate.config import Settings, Topics
+from safety_gate.topology import create_topics
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture(scope="session")
 def bootstrap():
-    """A fresh single-node Kafka per test module, configured for transactions."""
+    """One single-node Kafka for the whole test run, configured for transactions.
+
+    Set KAFKA_BOOTSTRAP_TEST=host:port to use a broker that is already running
+    instead of starting one in Docker.
+    """
+    existing = os.environ.get("KAFKA_BOOTSTRAP_TEST")
+    if existing:
+        yield existing
+        return
+
+    from testcontainers.community.kafka import KafkaContainer
+
     container = (
         KafkaContainer()
         # single broker: the internal transaction topic can only have 1 replica
@@ -15,13 +28,33 @@ def bootstrap():
         .with_env("KAFKA_TRANSACTION_STATE_LOG_MIN_ISR", "1")
     )
     with container as kafka:
-        servers = kafka.get_bootstrap_server()
-        admin = AdminClient({"bootstrap.servers": servers})
-        topics = [NewTopic(t, num_partitions=3, replication_factor=1)
-                  for t in (RAW_TOPIC, CLEAN_TOPIC, DLQ_TOPIC)]
-        topics.append(NewTopic(AUDIT_TOPIC, num_partitions=1, replication_factor=1))  # one ordered chain
-        topics.append(NewTopic(CONTROL_TOPIC, num_partitions=1, replication_factor=1,
-                               config={"cleanup.policy": "compact"}))                 # keeps the latest command
-        for future in admin.create_topics(topics).values():
-            future.result()
-        yield servers
+        yield kafka.get_bootstrap_server()
+
+
+def _fresh(bootstrap: str, **overrides) -> Settings:
+    """Settings with their own topics and group ids, so tests never see each other's messages."""
+    run = uuid.uuid4().hex[:8]
+    values: dict = dict(
+        bootstrap=bootstrap,
+        topics=Topics().with_prefix(f"t{run}"),
+        group_id=f"gate-{run}",
+        audit_group_id=f"audit-{run}",
+        model_group_id=f"model-{run}",
+        switch_check_s=0,                # strict: the switch is re-read before every batch
+    )
+    values.update(overrides)
+    settings = Settings(**values)
+    create_topics(settings)
+    return settings
+
+
+@pytest.fixture(scope="module")
+def settings(bootstrap):
+    """Shared by the tests of one module."""
+    return _fresh(bootstrap)
+
+
+@pytest.fixture
+def make_settings(bootstrap):
+    """For tests that need topics nobody else has touched: make_settings(batch_size=1, ...)."""
+    return lambda **overrides: _fresh(bootstrap, **overrides)
