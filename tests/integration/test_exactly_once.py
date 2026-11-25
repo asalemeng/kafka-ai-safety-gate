@@ -1,45 +1,35 @@
-import json
 import threading
-import uuid
 
 import pytest
 
 from safety_gate import gate
-from safety_gate.config import CLEAN_TOPIC
-from tests.integration.helpers import count_visible, new_request, send_raw, wait_for
+from tests.integration.helpers import Running, count_visible, in_clean, new_request, send_request, wait_for
 
 pytestmark = pytest.mark.integration
 
 
-def test_crash_between_write_and_commit_produces_no_visible_duplicate(bootstrap):
-    group = f"gate-{uuid.uuid4()}"
+def test_crash_between_write_and_commit_produces_no_visible_duplicate(make_settings):
+    settings = make_settings()
     request = new_request("deliver me exactly once")
-    is_ours = lambda p: p.get("request_id") == request["request_id"]
-    send_raw(bootstrap, json.dumps(request).encode())
+    send_request(settings, request)
 
     # 1. First gate instance crashes AFTER writing the output, BEFORE committing.
     def crash(msg):
         raise RuntimeError("simulated crash before commit")
 
     with pytest.raises(RuntimeError, match="simulated crash"):
-        gate.run(bootstrap=bootstrap, group_id=group, stop_event=threading.Event(), before_commit=crash)
+        gate.run(settings, threading.Event(), before_commit=crash)
 
     # 2. Whatever happened to the half-done write, it is invisible to normal consumers.
     #    (librdkafka may have discarded it client-side, or the broker rolled it back.)
-    assert wait_for(bootstrap, CLEAN_TOPIC, is_ours, timeout=8) is None
+    assert wait_for(settings, settings.topics.clean, in_clean(request), timeout=8) is None
 
     # 3. A new gate instance with the same group resumes from the last committed offset.
-    stop = threading.Event()
-    thread = threading.Thread(
-        target=gate.run,
-        kwargs={"bootstrap": bootstrap, "group_id": group, "stop_event": stop},
-        daemon=True,
-    )
-    thread.start()
+    running = Running(gate.run, settings.with_(instance_id="second-life"))
     try:
-        assert wait_for(bootstrap, CLEAN_TOPIC, is_ours) == request
+        assert wait_for(settings, settings.topics.clean, in_clean(request)) == request
         # 4. Exactly one committed copy, not two.
-        assert count_visible(bootstrap, CLEAN_TOPIC, is_ours) == 1
+        assert count_visible(settings, settings.topics.clean, in_clean(request)) == 1
+        running.assert_alive()
     finally:
-        stop.set()
-        thread.join(timeout=15)
+        running.shutdown()

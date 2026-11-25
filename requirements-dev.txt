@@ -1,16 +1,23 @@
+# Everything needed to run the tests and checks:  pip install -r requirements-dev.txt && pip install -e . --no-deps
+-r requirements.txt
 certifi==2026.10.23
 charset-normalizer==3.5.2
-confluent-kafka==2.16.1
 docker==7.2.0
 idna==3.20
 iniconfig==2.3.1
+librt==0.17.0
+mypy==2.4.1
+mypy_extensions==1.2.0
 packaging==26.3
+pathspec==1.1.1
 pluggy==1.7.0
 Pygments==2.21.0
 pytest==9.2.0
 python-dotenv==1.2.4
 requests==2.34.2
+ruff==0.17.6
 testcontainers==4.15.0
+types-PyYAML==6.0.12.20261122
 typing_extensions==4.16.0
 urllib3==2.8.0
 wrapt==2.5.2

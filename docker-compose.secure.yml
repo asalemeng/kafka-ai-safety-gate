@@ -1,0 +1,118 @@
+# The same stack with encryption (TLS), a login per program (SASL) and access
+# rules per topic (ACLs).
+#
+#   scripts/secure/make-certs.sh                                              # once
+#   docker compose -f docker-compose.secure.yml --env-file secure/.env up -d kafka
+#   scripts/secure/create-acls.sh                                             # once
+#   docker compose -f docker-compose.secure.yml --env-file secure/.env up --build
+#
+# Then check the rules:  see "Security" in the README (pytest -m secure).
+#
+# Listeners:
+#   SECURE     kafka:9094      TLS + login, for the other containers
+#   EXTERNAL   localhost:9095  TLS + login, for your machine
+#   INTERNAL / CONTROLLER      plain, bound to localhost INSIDE the broker
+#                              container only (the broker talking to itself and
+#                              the admin scripts via `docker exec`)
+
+x-app: &app
+  build: .
+  image: safety-gate:local
+  volumes:
+    - ./secure/ca.crt:/etc/safety-gate/ca.crt:ro
+
+x-secure-env: &secure-env
+  KAFKA_BOOTSTRAP: kafka:9094
+  KAFKA_SECURITY_PROTOCOL: SASL_SSL
+  KAFKA_SASL_MECHANISM: PLAIN
+  KAFKA_SSL_CA_LOCATION: /etc/safety-gate/ca.crt
+
+services:
+  kafka:
+    image: apache/kafka:3.8.0
+    container_name: kafka-secure
+    ports:
+      - "9095:9095"
+    volumes:
+      - ./secure/broker.p12:/etc/kafka/secrets/broker.p12:ro
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: SECURE://:9094,EXTERNAL://:9095,INTERNAL://localhost:19092,CONTROLLER://localhost:9093
+      KAFKA_ADVERTISED_LISTENERS: SECURE://kafka:9094,EXTERNAL://localhost:9095,INTERNAL://localhost:19092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: SECURE:SASL_SSL,EXTERNAL:SASL_SSL,INTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      # --- TLS ---
+      KAFKA_SSL_KEYSTORE_TYPE: PKCS12
+      KAFKA_SSL_KEYSTORE_LOCATION: /etc/kafka/secrets/broker.p12
+      KAFKA_SSL_KEYSTORE_PASSWORD: ${KEYSTORE_PASSWORD:?run scripts/secure/make-certs.sh and pass --env-file secure/.env}
+      KAFKA_SSL_KEY_PASSWORD: ${KEYSTORE_PASSWORD}
+      KAFKA_SSL_CLIENT_AUTH: none
+      # --- login: one user per program ---
+      KAFKA_SASL_ENABLED_MECHANISMS: PLAIN
+      KAFKA_LISTENER_NAME_SECURE_PLAIN_SASL_JAAS_CONFIG: &users >-
+        org.apache.kafka.common.security.plain.PlainLoginModule required
+        user_admin="${ADMIN_PASSWORD}"
+        user_client="${CLIENT_PASSWORD}"
+        user_gate="${GATE_PASSWORD}"
+        user_audit="${AUDIT_PASSWORD}"
+        user_operator="${OPERATOR_PASSWORD}"
+        user_model="${MODEL_PASSWORD}";
+      KAFKA_LISTENER_NAME_EXTERNAL_PLAIN_SASL_JAAS_CONFIG: *users
+      # --- access rules: nothing is allowed unless a rule says so ---
+      KAFKA_AUTHORIZER_CLASS_NAME: org.apache.kafka.metadata.authorizer.StandardAuthorizer
+      KAFKA_ALLOW_EVERYONE_IF_NO_ACL_FOUND: "false"
+      # ANONYMOUS is whoever uses the plain listeners, which are only reachable
+      # from inside this container.
+      KAFKA_SUPER_USERS: User:admin;User:ANONYMOUS
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:19092 > /dev/null 2>&1"]
+      interval: 5s
+      timeout: 10s
+      retries: 12
+
+  gate:
+    <<: *app
+    command: ["safety_gate.gate"]
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      <<: *secure-env
+      KAFKA_SASL_USERNAME: gate
+      KAFKA_SASL_PASSWORD: ${GATE_PASSWORD}
+      METRICS_PORT: "9100"
+    ports:
+      - "9100:9100"
+    restart: unless-stopped
+
+  audit-sink:
+    <<: *app
+    command: ["safety_gate.audit_sink"]
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      <<: *secure-env
+      KAFKA_SASL_USERNAME: audit
+      KAFKA_SASL_PASSWORD: ${AUDIT_PASSWORD}
+    restart: "no"
+
+  model-service:
+    <<: *app
+    command: ["safety_gate.model_stub"]
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      <<: *secure-env
+      KAFKA_SASL_USERNAME: model
+      KAFKA_SASL_PASSWORD: ${MODEL_PASSWORD}
+    restart: unless-stopped

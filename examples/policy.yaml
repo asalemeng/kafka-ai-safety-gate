@@ -1,0 +1,34 @@
+# Example company policy for the gate.  Start the gate with:
+#   GATE_POLICY_FILE=examples/policy.yaml python -m safety_gate.gate
+# The file is re-read while the gate runs. A version with a mistake is rejected
+# and the previous version stays active.
+version: "2026-11-25"
+
+defaults:
+  max_prompt_chars: 4000
+  pii: block                 # block | redact | off
+  prompt_injection: block    # block | off
+  rules:
+    - id: project-names
+      type: keyword
+      terms: ["Project Falcon", "Projekt Falke"]
+      action: block
+      reason: confidential_term
+    - id: customer-numbers
+      type: regex
+      pattern: '\bKD-\d{6}\b'
+      action: redact         # the request still goes to the model, without the number
+
+tenants:
+  t-bank:
+    max_prompt_chars: 2000
+    pii: block
+  t-helpdesk:
+    pii: redact              # helpdesk staff paste e-mails; mask them and carry on
+
+semantic:
+  enabled: true
+  threshold: 0.5
+  sources:
+    - {id: known-attacks, kind: attack, builtin: known_attacks}
+    - {id: board-paper-14, kind: confidential, path: confidential/board-paper.txt, tenants: [t-bank]}

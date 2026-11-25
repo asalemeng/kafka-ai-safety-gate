@@ -1,9 +1,64 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "safety-gate"
-version = "0.1.0"
+version = "0.2.0"
+description = "A safety gate for AI requests on Apache Kafka: checks, exactly-once routing, audit chain, kill switch"
+readme = "README.md"
 requires-python = ">=3.11"
+dependencies = [
+    "confluent-kafka>=2.6",
+    "prometheus-client>=0.20",
+    "PyYAML>=6.0",
+    "cryptography>=42",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "testcontainers>=4.8",
+    "ruff>=0.6",
+    "mypy>=1.11",
+    "types-PyYAML",
+]
+
+[project.scripts]
+safety-gate = "safety_gate.gate:main"
+safety-gate-audit = "safety_gate.audit_sink:main"
+safety-gate-verify = "safety_gate.verify:main"
+safety-gate-switch = "safety_gate.switchctl:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+safety_gate = ["data/*.txt"]
 
 [tool.pytest.ini_options]
-pythonpath = ["src"]
+pythonpath = ["src", "."]
 testpaths = ["tests"]
-markers = ["integration: starts a real Kafka in Docker (slow)"]
+markers = [
+    "integration: starts a real Kafka in Docker (slow)",
+    "secure: needs the TLS + login + ACL stack from docker-compose.secure.yml",
+]
+
+[tool.ruff]
+line-length = 125
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+
+[tool.mypy]
+python_version = "3.11"
+files = ["src"]
+warn_unused_ignores = true
+warn_redundant_casts = true
+check_untyped_defs = true
+
+[[tool.mypy.overrides]]
+module = ["confluent_kafka.*", "testcontainers.*"]
+ignore_missing_imports = true

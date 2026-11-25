@@ -9,16 +9,16 @@ import sys
 
 from confluent_kafka import Producer
 
-from safety_gate.config import BOOTSTRAP, CONTROL_TOPIC
+from safety_gate.config import Settings
 from safety_gate.killswitch import DISABLED, ENABLED
 
 
-def send_command(bootstrap: str, mode: str, reason: str = "", issued_by: str = "") -> None:
+def send_command(settings: Settings, mode: str, reason: str = "", issued_by: str = "") -> None:
     """Write one command to the control topic and wait until the broker confirms it."""
     errors: list = []
-    producer = Producer({"bootstrap.servers": bootstrap, "acks": "all"})
+    producer = Producer({**settings.client_config(), "acks": "all"})
     producer.produce(
-        CONTROL_TOPIC,
+        settings.topics.control,
         partition=0,
         key="gate",
         value=json.dumps({"mode": mode, "reason": reason, "issued_by": issued_by}).encode("utf-8"),
@@ -38,7 +38,7 @@ def main() -> int:
     args = parser.parse_args()
 
     mode = DISABLED if args.action == "disable" else ENABLED
-    send_command(BOOTSTRAP, mode, args.reason, args.by)
+    send_command(Settings.from_env(), mode, args.reason, args.by)
     print(f"kill switch command confirmed: {mode}")
     return 0
 
