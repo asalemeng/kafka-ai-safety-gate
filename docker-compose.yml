@@ -49,13 +49,15 @@ services:
     volumes:
       - audit-keys:/var/lib/safety-gate/keys
     entrypoint: ["sh", "-c"]
+    # Every line of the script below has the same indentation on purpose: YAML
+    # joins such lines into one. A deeper-indented line would start a new command.
     command:
       - >
         python -m safety_gate.topology &&
         ( [ -f /var/lib/safety-gate/keys/audit.key ] ||
-          python -m safety_gate.checkpoints keygen
-          --private /var/lib/safety-gate/keys/audit.key
-          --public /var/lib/safety-gate/keys/audit.pub )
+        python -m safety_gate.checkpoints keygen
+        --private /var/lib/safety-gate/keys/audit.key
+        --public /var/lib/safety-gate/keys/audit.pub )
 
   gate:
     <<: *app
