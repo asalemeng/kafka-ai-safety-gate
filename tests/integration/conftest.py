@@ -58,3 +58,9 @@ def settings(bootstrap):
 def make_settings(bootstrap):
     """For tests that need topics nobody else has touched: make_settings(batch_size=1, ...)."""
     return lambda **overrides: _fresh(bootstrap, **overrides)
+
+
+@pytest.fixture(scope="module")
+def make_settings_module(bootstrap):
+    """Own topics for one test module, strict about the kill switch."""
+    return _fresh(bootstrap)

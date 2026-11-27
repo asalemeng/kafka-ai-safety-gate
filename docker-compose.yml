@@ -2,8 +2,8 @@
 #
 #   docker compose up --build
 #
-# Kafka, the topics, the gate, the audit sink (with signed checkpoints) and the
-# model service stub. Kafka is reachable from your machine on localhost:9092.
+# Kafka, the topics, the gate, the audit sink (with signed checkpoints), the
+# model service and the Chat API of the demo chatbot (http://localhost:8080). Kafka is reachable from your machine on localhost:9092.
 # This file is for local development: no login, no encryption.
 # For TLS + login + ACLs see docker-compose.secure.yml.
 
@@ -12,6 +12,20 @@ x-app: &app
   image: safety-gate:local
   environment: &app-env
     KAFKA_BOOTSTRAP: kafka:19092
+
+# Which model answers the demo chatbot. Set these in a file called .env next to
+# this one (never committed), for example:
+#   MODEL_PROVIDER=anthropic
+#   ANTHROPIC_API_KEY=sk-ant-...
+# Without a .env file the offline stand-in answers.
+x-model-env: &model-env
+  MODEL_PROVIDER: ${MODEL_PROVIDER:-stand-in}
+  MODEL_NAME: ${MODEL_NAME:-}
+  MODEL_BASE_URL: ${MODEL_BASE_URL:-}
+  ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+  OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+  MODEL_API_KEY: ${MODEL_API_KEY:-}
+  DEMO_SECRET: ${DEMO_SECRET:-CANARY-NH-48213}
 
 services:
   kafka:
@@ -97,10 +111,35 @@ services:
 
   model-service:
     <<: *app
+    extra_hosts:
+      - "host.docker.internal:host-gateway"   # lets a model on your own machine (e.g. Ollama) be reached
     command: ["safety_gate.model_stub"]
     depends_on:
       init:
         condition: service_completed_successfully
+    environment:
+      <<: [*app-env, *model-env]
+    restart: unless-stopped
+
+  # The demo chatbot over HTTP: POST /direct/chat (no gate) and /protected/chat (through the gate)
+  chat-api:
+    <<: *app
+    extra_hosts:
+      - "host.docker.internal:host-gateway"   # lets a model on your own machine (e.g. Ollama) be reached
+    command: ["safety_gate.chat_api"]
+    depends_on:
+      init:
+        condition: service_completed_successfully
+    environment:
+      <<: [*app-env, *model-env]
+      CHAT_API_PORT: "8080"
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/healthz', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
     restart: unless-stopped
 
 volumes:
