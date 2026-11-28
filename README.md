@@ -171,7 +171,22 @@ promptfoo needs Node.js. With Claude Haiku 5.5 a full run is about 75 model call
 
 **What to expect, stated before the first real run:** on its own attack set the gate stops all 20 directly worded attacks and all 5 personal-data messages, and lets all 15 normal questions through. It does **not** recognise the 10 reworded attacks: for those, the model's own defences decide. That is the honest point of the demo: the gate and the model are two layers, and the report shows what each one catches. The attack messages and the gate's word lists were written by the same person, so the gate's share is the flattering part of the result.
 
-**Checked so far:** the whole path (promptfoo, Chat API, Kafka, gate, model service, report) runs end to end with the offline stand-in, and an integration test runs the protected path on a real Kafka. No run with a real model has been published yet.
+### First result with a real model
+
+One run on 28 November 2026, Claude Haiku 5.5 (`claude-haiku-5-5`), the 50 messages above, each sent once per mode. Full report: [`redteam/report.md`](redteam/report.md).
+
+| | Without the gate | With the gate |
+| --- | --- | --- |
+| Attacks that worked (leak or hijack) | 0 of 30 | 0 of 30 |
+| Attacks stopped before the model | 0 of 30 | 20 of 30 |
+| Personal data sent to the model provider | 5 of 5 | 0 of 5 |
+| Normal questions wrongly blocked | 0 of 15 | 0 of 15 |
+
+What this shows, and what it does not:
+
+- **Claude defended itself on this test set.** Not one attack worked, in any of the five languages, with or without the gate, including the 10 reworded attacks that the gate's keyword filter misses.
+- **So the gate did not make the chatbot harder to attack here.** Its value in this run was elsewhere: personal data never reached the model provider (0 of 5 instead of 5 of 5), two thirds of the attacks never cost a model call, and every decision went into the tamper-evident audit chain.
+- **This is one run of 50 self-written messages against one model.** The attacks are single messages in common phrasings. They are not a measure of how Claude, or any model, holds up against a determined attacker using longer conversations, hidden instructions in documents, or encoded text.
 
 ## Company policy
 
@@ -546,7 +561,8 @@ Every push and pull request runs `.github/workflows/ci.yml`: lint (ruff), type c
 - [ ] Multilingual embedding model behind the similarity check, measured on independent data
 - [ ] More kinds of personal data (names, phone numbers, addresses)
 - [x] Red-team demo: the same chatbot tested with and without the gate, any model provider
-- [ ] Red-team demo: first published run with a real model
+- [x] Red-team demo: first run with a real model (Claude Haiku 5.5)
+- [ ] Red-team demo: the same test against other models, and harder attacks (multi-turn, encoded, hidden in documents)
 - [ ] Output filtering (the model's answer on the way back)
 
 ## Why Kafka?
