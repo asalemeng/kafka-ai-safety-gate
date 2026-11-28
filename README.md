@@ -171,6 +171,20 @@ promptfoo needs Node.js. With Claude Haiku 5.5 a full run is about 75 model call
 
 **What to expect, stated before the first real run:** on its own attack set the gate stops all 20 directly worded attacks and all 5 personal-data messages, and lets all 15 normal questions through. It does **not** recognise the 10 reworded attacks: for those, the model's own defences decide. That is the honest point of the demo: the gate and the model are two layers, and the report shows what each one catches. The attack messages and the gate's word lists were written by the same person, so the gate's share is the flattering part of the result.
 
+### The demo console
+
+Open **http://localhost:8080/** while the stack runs. Three tabs:
+
+| Tab | What it shows |
+| --- | --- |
+| Try it | One message, two answers side by side: straight to the model, and through Kafka and the gate. Examples in five languages, one click each. |
+| Live | The gate's counters (decided, passed, blocked by reason), the kill switch with buttons, and every decision as it arrives on Kafka, masked as the gate stored it. |
+| Test results | One card per model from the red-team runs: what worked without and with the gate, by language, and every failed check. |
+
+`python -m safety_gate.redteam report --model "<name>"` also saves a summary to `redteam/summaries/`, which is what the Test results tab reads. Run the report again for older runs to make them appear.
+
+The console has **no login**. Docker publishes it on `127.0.0.1` only, so only your own machine can open it. Its kill switch buttons really stop traffic. Do not publish port 8080 to a network without putting a login in front of it. The page loads nothing from other sites and inserts prompts and answers only as text, never as HTML; tests check both.
+
 ### First result with a real model
 
 One run on 28 November 2026, Claude Haiku 5.5 (`claude-haiku-5-5`), the 50 messages above, each sent once per mode. Full report: [`redteam/report.md`](redteam/report.md).
@@ -468,12 +482,13 @@ Trust assumptions: the Kafka brokers and their administrators, the host the gate
 │   ├── model_stub.py             # model service: calls the model, honours the kill switch
 │   ├── llm.py                    # model backends: Claude, OpenAI, OpenAI-compatible, offline stand-in
 │   ├── chat_api.py               # demo chatbot over HTTP, direct or through the gate
+│   ├── console.py, web/          # demo console: data routes and the single-page UI
 │   ├── redteam.py                # builds the promptfoo tests, writes the comparison report
 │   ├── kafka_io.py               # small helpers around the Kafka client
 │   └── bench.py                  # throughput and latency benchmark
 └── tests/
     ├── data/                     # labelled examples: injection (70), similarity (60)
-    ├── unit/                     # 202 tests, no Docker; fakes.py is an in-memory stand-in for Kafka
+    ├── unit/                     # 218 tests, no Docker; fakes.py is an in-memory stand-in for Kafka
     ├── integration/              # 28 tests on a real Kafka (Testcontainers)
     └── secure/                   # 6 tests of the access rules (need the secure stack)
 ```
@@ -562,6 +577,7 @@ Every push and pull request runs `.github/workflows/ci.yml`: lint (ruff), type c
 - [ ] More kinds of personal data (names, phone numbers, addresses)
 - [x] Red-team demo: the same chatbot tested with and without the gate, any model provider
 - [x] Red-team demo: first run with a real model (Claude Haiku 5.5)
+- [x] Demo console: try it side by side, live decisions and kill switch, red-team results per model
 - [ ] Red-team demo: the same test against other models, and harder attacks (multi-turn, encoded, hidden in documents)
 - [ ] Output filtering (the model's answer on the way back)
 

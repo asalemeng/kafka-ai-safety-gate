@@ -38,7 +38,7 @@ safety-gate-redteam = "safety_gate.redteam:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-safety_gate = ["data/*.txt"]
+safety_gate = ["data/*.txt", "web/*.html"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src", "."]

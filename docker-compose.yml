@@ -121,7 +121,8 @@ services:
       <<: [*app-env, *model-env]
     restart: unless-stopped
 
-  # The demo chatbot over HTTP: POST /direct/chat (no gate) and /protected/chat (through the gate)
+  # The demo chatbot over HTTP: POST /direct/chat (no gate) and /protected/chat (through the gate),
+  # and the demo console at http://localhost:8080/ (no login: published on this machine only)
   chat-api:
     <<: *app
     extra_hosts:
@@ -133,8 +134,12 @@ services:
     environment:
       <<: [*app-env, *model-env]
       CHAT_API_PORT: "8080"
+      GATE_METRICS_URL: http://gate:9100/metrics
+      REDTEAM_SUMMARIES_DIR: /app/redteam/summaries
+    volumes:
+      - ./redteam/summaries:/app/redteam/summaries:ro
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/healthz', timeout=3)"]
       interval: 10s

@@ -18,9 +18,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from collections import Counter, defaultdict
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 
 from safety_gate.chat_api import BLOCKED_PREFIX
@@ -219,6 +221,37 @@ def report(outcomes: list[Outcome], model_name: str = "", gate_note: str = "") -
     return "\n".join(lines) + "\n"
 
 
+def summary(outcomes: list[Outcome], model_name: str, created: str) -> dict:
+    """The numbers behind the report, as JSON, for the console's Test results page."""
+    modes = sorted({o.mode for o in outcomes}, key=lambda m: (m != "without-gate", m))
+    by_language: dict[str, dict[str, list[int]]] = {}
+    for m in modes:
+        by_language[m] = {}
+        for code in LANGUAGES:
+            tried = [o for o in outcomes if o.mode == m and o.language == code and o.category in ("leak", "obey")
+                     and o.status not in ("error", "timeout")]
+            by_language[m][code] = [sum(not o.passed for o in tried), len(tried)]
+    failures = [
+        {"mode": o.mode, "id": o.id, "category": o.category, "language": o.language, "style": o.style,
+         "status": o.status, "answer": o.answer[:300]}
+        for o in sorted(outcomes, key=lambda o: (o.mode, o.id)) if not o.passed
+    ]
+    return {
+        "kind": "redteam-summary",
+        "version": 1,
+        "model": model_name or "unnamed model",
+        "created": created,
+        "languages": LANGUAGES,
+        "modes": {m: asdict(summarise(outcomes, m)) for m in modes},
+        "by_language": by_language,
+        "failures": failures,
+    }
+
+
+def slug(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")[:60] or "model"
+
+
 # --- command line ----------------------------------------------------------------------
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Red-team demo: build the tests, write the report.")
@@ -231,6 +264,8 @@ def main(argv: list[str] | None = None) -> int:
     rep.add_argument("--results", type=Path, default=REDTEAM_DIR / "results.json")
     rep.add_argument("--out", type=Path, default=REDTEAM_DIR / "report.md")
     rep.add_argument("--model", default="", help="name of the model, for the report heading")
+    rep.add_argument("--summary-dir", type=Path, default=REDTEAM_DIR / "summaries",
+                     help="where the JSON summary for the console goes (one file per model)")
     args = parser.parse_args(argv)
 
     if args.command == "build":
@@ -247,6 +282,12 @@ def main(argv: list[str] | None = None) -> int:
     text = report(outcomes, args.model)
     args.out.write_text(text, encoding="utf-8")
     print(text)
+    created = datetime.fromtimestamp(args.results.stat().st_mtime, tz=UTC).isoformat(timespec="minutes")
+    args.summary_dir.mkdir(parents=True, exist_ok=True)
+    target = args.summary_dir / f"{slug(args.model)}.json"
+    target.write_text(json.dumps(summary(outcomes, args.model, created), ensure_ascii=False, indent=2),
+                      encoding="utf-8")
+    print(f"summary for the console written to {target}")
     per_mode: dict[str, int] = defaultdict(int)
     for o in outcomes:
         per_mode[o.mode] += 1

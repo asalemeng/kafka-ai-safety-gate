@@ -3,6 +3,7 @@
     POST /direct/chat      {"message": "..."}   straight to the model, no checks
     POST /protected/chat   {"message": "..."}   through Kafka: raw topic -> gate -> model service
     GET  /healthz
+    GET  /                 the demo console (see console.py for its /api/... routes)
 
 Both answer with the same shape:
 
@@ -27,12 +28,16 @@ import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 from confluent_kafka import Consumer, Producer, TopicPartition
 
 from safety_gate.config import Settings
-from safety_gate.kafka_io import consumer_config
+from safety_gate.console import ActivityLog, Console, KillSwitchControl, page
+from safety_gate.control import SwitchWatcher
+from safety_gate.kafka_io import consumer_config, reader_config
 from safety_gate.llm import ModelConfig, ModelError, build_backend
+from safety_gate.switchctl import send_command
 
 log = logging.getLogger("chat")
 
@@ -53,8 +58,10 @@ class Waiter:
 class ReplyRouter:
     """Matches answers arriving on Kafka to the HTTP requests waiting for them."""
 
-    def __init__(self, consumer, responses_topic: str, dlq_topic: str) -> None:
+    def __init__(self, consumer, responses_topic: str, dlq_topic: str,
+                 on_message: Callable[[bool, str | None, dict], None] | None = None) -> None:
         self.consumer = consumer
+        self.on_message = on_message          # sees every message, waited for or not (the console's feed)
         self.responses_topic = responses_topic
         self.dlq_topic = dlq_topic
         self.ready = threading.Event()
@@ -111,15 +118,22 @@ class ReplyRouter:
         """Hand one Kafka message to the request waiting for it. False if nobody waits."""
         key = msg.key()
         request_id = key.decode("utf-8", errors="replace") if isinstance(key, bytes) else key
-        with self._lock:
-            waiter = self._waiting.pop(request_id, None) if request_id else None
-        if waiter is None:
-            return False
         try:
             payload = json.loads(msg.value())
         except (TypeError, ValueError):
             payload = {}
-        waiter.result = to_result(msg.topic() == self.dlq_topic, payload if isinstance(payload, dict) else {})
+        payload = payload if isinstance(payload, dict) else {}
+        from_dlq = msg.topic() == self.dlq_topic
+        if self.on_message is not None:
+            try:
+                self.on_message(from_dlq, request_id, payload)
+            except Exception:
+                log.exception("console feed failed")
+        with self._lock:
+            waiter = self._waiting.pop(request_id, None) if request_id else None
+        if waiter is None:
+            return False
+        waiter.result = to_result(from_dlq, payload)
         waiter.done.set()
         return True
 
@@ -143,8 +157,10 @@ class ChatService:
     """The two ways to reach the demo chatbot. HTTP is a thin layer on top."""
 
     def __init__(self, settings: Settings, direct: Callable[[str], str], producer=None,
-                 router: ReplyRouter | None = None, timeout_s: float = 60.0, tenant_id: str = "t-demo") -> None:
+                 router: ReplyRouter | None = None, timeout_s: float = 60.0, tenant_id: str = "t-demo",
+                 console: Console | None = None) -> None:
         self.settings = settings
+        self.console = console or Console()
         self.direct_model = direct
         self.producer = producer
         self.router = router
@@ -187,32 +203,56 @@ class ChatService:
 def make_handler(service: ChatService):
     class Handler(BaseHTTPRequestHandler):
         def do_POST(self) -> None:   # noqa: N802 (name required by http.server)
+            body = self._read_json()
+            if body is _BAD:
+                return
             mode = {"/direct/chat": "direct", "/protected/chat": "protected"}.get(self.path)
             if mode is None:
-                return self._send(404, {"error": "use POST /direct/chat or POST /protected/chat"})
-            length = int(self.headers.get("Content-Length") or 0)
-            if length <= 0 or length > MAX_BODY_BYTES:
-                return self._send(400, {"error": f"body must be 1 to {MAX_BODY_BYTES} bytes of JSON"})
-            try:
-                body = json.loads(self.rfile.read(length))
-            except ValueError:
-                return self._send(400, {"error": "body is not valid JSON"})
+                handled = service.console.post(self.path, body)
+                if handled is None:
+                    return self._send(404, {"error": "use POST /direct/chat or POST /protected/chat"})
+                return self._send(*handled)
             message = body.get("message") if isinstance(body, dict) else None
             if not isinstance(message, str) or not message.strip():
                 return self._send(400, {"error": 'send {"message": "<text>"}'})
             self._send(200, service.handle(mode, message))
 
         def do_GET(self) -> None:    # noqa: N802
+            if self.path in ("/", "/index.html"):
+                return self._send_bytes(200, page(), "text/html; charset=utf-8")
             if self.path == "/healthz":
                 ok = service.router is None or service.router.ready.is_set()
                 return self._send(200 if ok else 503, {"status": "ok" if ok else "starting"})
-            self._send(404, {"error": "not found"})
+            handled = service.console.get(self.path)
+            if handled is None:
+                return self._send(404, {"error": "not found"})
+            self._send(*handled)
+
+        def _read_json(self):
+            length = int(self.headers.get("Content-Length") or 0)
+            if length <= 0 or length > MAX_BODY_BYTES:
+                self._send(400, {"error": f"body must be 1 to {MAX_BODY_BYTES} bytes of JSON"})
+                return _BAD
+            try:
+                return json.loads(self.rfile.read(length))
+            except ValueError:
+                self._send(400, {"error": "body is not valid JSON"})
+                return _BAD
 
         def _send(self, status: int, payload: dict) -> None:
-            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            self._send_bytes(status, json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                             "application/json; charset=utf-8")
+
+        def _send_bytes(self, status: int, body: bytes, content_type: str) -> None:
             self.send_response(status)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            # the page loads nothing from outside: no scripts, fonts or images from other sites
+            self.send_header("Content-Security-Policy",
+                             "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; "
+                             "img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'")
             self.end_headers()
             self.wfile.write(body)
 
@@ -222,6 +262,9 @@ def make_handler(service: ChatService):
     return Handler
 
 
+_BAD = object()
+
+
 def serve(service: ChatService, port: int, host: str = "0.0.0.0") -> ThreadingHTTPServer:
     server = ThreadingHTTPServer((host, port), make_handler(service))
     server.daemon_threads = True
@@ -229,16 +272,32 @@ def serve(service: ChatService, port: int, host: str = "0.0.0.0") -> ThreadingHT
     return server
 
 
-def build_service(settings: Settings, model: ModelConfig | None = None, timeout_s: float = 60.0) -> ChatService:
+def build_console(settings: Settings, metrics_url: str | None, summaries_dir: Path | None,
+                  model_name: str = "") -> Console:
+    watcher = SwitchWatcher(Consumer(reader_config(settings, "console-control")), settings.topics.control)
+
+    def read_state() -> dict:
+        switch = watcher.refresh()
+        return {"disabled": switch.disabled, "reason": switch.reason, "last_reason": switch.last_reason}
+
+    def send(mode: str, reason: str, issued_by: str) -> None:
+        send_command(settings, mode, reason, issued_by)
+
+    return Console(ActivityLog(), metrics_url, summaries_dir, KillSwitchControl(read_state, send), model_name)
+
+
+def build_service(settings: Settings, model: ModelConfig | None = None, timeout_s: float = 60.0,
+                  metrics_url: str | None = None, summaries_dir: Path | None = None) -> ChatService:
     model = model or ModelConfig.from_env()
     backend = build_backend(model)
     log.info("model backend: %s", backend.name)
+    console = build_console(settings, metrics_url, summaries_dir, backend.name)
     consumer = Consumer(consumer_config(
         settings, f"chat-api-{uuid.uuid4().hex[:8]}", **{"isolation.level": "read_committed"}))
-    router = ReplyRouter(consumer, settings.topics.responses, settings.topics.dlq)
+    router = ReplyRouter(consumer, settings.topics.responses, settings.topics.dlq, console.activity.record)
     producer = Producer({**settings.client_config(), "acks": "all", "enable.idempotence": True, "linger.ms": 0})
     return ChatService(settings, lambda text: backend.reply(model.system_prompt, text),
-                       producer, router, timeout_s)
+                       producer, router, timeout_s, console=console)
 
 
 def main() -> None:
@@ -246,11 +305,14 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     settings = Settings.from_env()
     port = int(os.environ.get("CHAT_API_PORT", "8080"))
-    service = build_service(settings, timeout_s=float(os.environ.get("CHAT_TIMEOUT_S", "60")))
+    summaries = os.environ.get("REDTEAM_SUMMARIES_DIR", "redteam/summaries")
+    service = build_service(settings, timeout_s=float(os.environ.get("CHAT_TIMEOUT_S", "60")),
+                            metrics_url=os.environ.get("GATE_METRICS_URL") or None,
+                            summaries_dir=Path(summaries) if summaries else None)
     assert service.router is not None
     service.router.start()
     server = serve(service, port)
-    log.info("chat API on :%d (POST /direct/chat, POST /protected/chat)", port)
+    log.info("chat API and console on :%d (open http://localhost:%d/)", port, port)
     stop = threading.Event()
     signal.signal(signal.SIGINT, lambda *_: stop.set())
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
