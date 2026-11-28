@@ -1,13 +1,14 @@
-"""A stand-in for the model service, to show the kill switch is honoured after the gate too.
+"""The model service: takes checked requests from the clean topic, asks the model, writes the answer.
 
-Why it matters: a request can already be in the clean topic at the moment an
-operator pulls the switch. The gate cannot take it back. So the service that
-calls the model reads the same control topic and refuses to call the model
+Which model answers is set by MODEL_PROVIDER (see `llm.py`): Claude, OpenAI,
+any OpenAI-compatible service, or an offline stand-in.
+
+It also honours the kill switch. A request can already be in the clean topic
+at the moment an operator pulls the switch, and the gate cannot take it back.
+So this service reads the same control topic and refuses to call the model
 while the switch is on.
 
-This is a stub. It "answers" by echoing, and it delivers at least once (a
-response can be repeated after a crash). A real model service would replace
-`call_model` and keep the kill switch check exactly as it is here.
+Delivery is at least once: after a crash an answer can be written twice.
 """
 from __future__ import annotations
 
@@ -22,12 +23,23 @@ from confluent_kafka import Consumer, Producer
 from safety_gate.config import Settings
 from safety_gate.control import SwitchWatcher
 from safety_gate.kafka_io import consumer_config, reader_config
+from safety_gate.llm import ModelBackend, ModelConfig, ModelError, build_backend
 
 log = logging.getLogger("model")
 
 
 def echo_model(request: dict) -> str:
     return f"(stub answer to request {request.get('request_id')})"
+
+
+def model_caller(backend: ModelBackend, system_prompt: str) -> Callable[[dict], str]:
+    """Turn a model backend into the function the service calls for each request."""
+    def call(request: dict) -> str:
+        prompt = request.get("prompt")
+        if not isinstance(prompt, str):
+            raise ModelError("request has no prompt")
+        return backend.reply(system_prompt, prompt)
+    return call
 
 
 class ModelService:
@@ -61,7 +73,12 @@ class ModelService:
         if switch.disabled:
             response.update(status="REJECTED", reason="kill_switch", kill_switch_reason=switch.reason)
         else:
-            response.update(status="OK", answer=self.call_model(request))
+            try:
+                response.update(status="OK", answer=self.call_model(request))
+            except Exception as exc:
+                # a model that is down must not stop the service; the caller gets a clear error
+                log.error("model call failed for %s: %s", request.get("request_id"), exc)
+                response.update(status="ERROR", error=str(exc) if isinstance(exc, ModelError) else type(exc).__name__)
 
         self.producer.produce(self.topics.responses, key=msg.key(),
                               value=json.dumps(response, ensure_ascii=False).encode("utf-8"))
@@ -78,16 +95,23 @@ class ModelService:
                 log.exception("error while closing a Kafka client")
 
 
-def build_service(settings: Settings, call_model: Callable[[dict], str] = echo_model) -> ModelService:
+def configured_model() -> Callable[[dict], str]:
+    config = ModelConfig.from_env()
+    backend = build_backend(config)
+    log.info("model backend: %s", backend.name)
+    return model_caller(backend, config.system_prompt)
+
+
+def build_service(settings: Settings, call_model: Callable[[dict], str] | None = None) -> ModelService:
     consumer = Consumer(consumer_config(
         settings, settings.model_group_id, **{"isolation.level": "read_committed"}))
     producer = Producer({**settings.client_config(), "acks": "all", "enable.idempotence": True})
     watcher = SwitchWatcher(Consumer(reader_config(settings, "model-control")), settings.topics.control)
-    return ModelService(settings, consumer, producer, watcher, call_model)
+    return ModelService(settings, consumer, producer, watcher, call_model or configured_model())
 
 
 def run(settings: Settings | None = None, stop_event: threading.Event | None = None,
-        call_model: Callable[[dict], str] = echo_model) -> None:
+        call_model: Callable[[dict], str] | None = None) -> None:
     settings = settings or Settings.from_env()
     stop_event = stop_event or threading.Event()
     service = build_service(settings, call_model)

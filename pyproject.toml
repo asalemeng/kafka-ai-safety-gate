@@ -13,6 +13,8 @@ dependencies = [
     "prometheus-client>=0.20",
     "PyYAML>=6.0",
     "cryptography>=42",
+    "anthropic>=2.14",       # model backends for the demo chatbot
+    "openai>=3.60",
 ]
 
 [project.optional-dependencies]
@@ -29,12 +31,14 @@ safety-gate = "safety_gate.gate:main"
 safety-gate-audit = "safety_gate.audit_sink:main"
 safety-gate-verify = "safety_gate.verify:main"
 safety-gate-switch = "safety_gate.switchctl:main"
+safety-gate-chat = "safety_gate.chat_api:main"
+safety-gate-redteam = "safety_gate.redteam:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.setuptools.package-data]
-safety_gate = ["data/*.txt"]
+safety_gate = ["data/*.txt", "web/*.html"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src", "."]

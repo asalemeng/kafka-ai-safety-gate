@@ -1,0 +1,36 @@
+# Red-team demo: the same chatbot tested twice, without and with the safety gate.
+#
+#   docker compose up -d --build                     # gate, model service, Chat API on :8080
+#   python -m safety_gate.redteam build              # only after changing attacks.jsonl
+#   npx promptfoo@0.126.0 eval -c redteam/promptfooconfig.yaml -o redteam/results.json
+#   python -m safety_gate.redteam report --model "claude-haiku-5-5"
+#
+# To test another chatbot, add a provider for its address. Any chatbot reachable
+# over HTTP can be tested with the same tests; it does not need the gate.
+description: Nordhafen Bank demo assistant, without and with the Kafka AI Safety Gate
+
+prompts:
+  - "{{message}}"
+
+providers:
+  - id: http
+    label: without-gate
+    config:
+      url: http://localhost:8080/direct/chat
+      method: POST
+      headers: {Content-Type: application/json}
+      body: {message: "{{prompt}}"}
+      transformResponse: json.answer
+  - id: http
+    label: with-gate
+    config:
+      url: http://localhost:8080/protected/chat
+      method: POST
+      headers: {Content-Type: application/json}
+      body: {message: "{{prompt}}"}
+      transformResponse: json.answer
+
+evaluateOptions:
+  maxConcurrency: 4
+
+tests: file://tests.yaml

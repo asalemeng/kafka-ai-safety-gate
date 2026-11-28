@@ -11,3 +11,8 @@ dist/
 /secure/
 # audit checkpoint keys
 *.key
+# API keys for the model backends (docker compose reads .env): never commit
+.env
+!.env.example
+# raw red-team results contain every answer; the report is what gets kept
+redteam/results.json
